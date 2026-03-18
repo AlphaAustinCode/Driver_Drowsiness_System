@@ -46,7 +46,9 @@ Driver_Drowsiness_System/
 │   ├── balance_dataset.py         # Day 1 ✅
 │   ├── extract_yawdd_frames_v2.py # Day 1 ✅
 │   ├── inspect_avi_dataset.py     # Day 1 ✅
-│   └── augment_yawn.py            # Day 1 ✅
+│   ├── augment_yawn.py            # Day 1 ✅
+│   ├── train_model.py             # Day 2 ✅
+│   └── evaluate_model.py          # Day 2 ✅
 │
 ├── core/                          # Day 3+
 │   ├── detector.py                # EAR / MAR / head pose logic
@@ -56,8 +58,15 @@ Driver_Drowsiness_System/
 ├── database/
 │   └── db_queries.py              # CRUD helpers (Day 3+)
 │
-├── models/                        # Day 2+
-│   └── drowsiness_model.keras     # trained CNN weights
+├── models/
+│   ├── drowsiness_model.keras     # Day 2 ✅ final trained model (96.19% test acc)
+│   └── phase1_best.keras          # Day 2 ✅ Phase 1 checkpoint (86.99% val acc)
+│
+├── logs/
+│   ├── training/                  # TensorBoard logs + CSV training log
+│   └── plots/
+│       ├── training_curves.png    # Day 2 ✅ accuracy + loss curves
+│       └── confusion_matrix.png   # Day 2 ✅ per-class confusion matrix
 │
 ├── data/
 │   └── alarm.wav                  # alert sound file
@@ -160,26 +169,90 @@ Only `main.py` switches between `mode = "virtual"` and `mode = "hardware"`.
 
 ---
 
-### Day 2 — CNN Model
-**Date:** _(pending)_
-**Status:** 🔄 Upcoming
+### Day 2 — CNN Model Training & Evaluation
+**Date:** 2026-03-18
+**Status:** ✅ Complete
 
-#### Plan
-- [ ] Build CNN using MobileNetV2 (transfer learning)
-- [ ] ImageDataGenerator with augmentation for training
-- [ ] Train on 216,000 images
-- [ ] Evaluate on validation set
-- [ ] Plot accuracy + loss curves
-- [ ] Save best model as `models/drowsiness_model.keras`
-- [ ] Test on 27,000 test images
-- [ ] Generate confusion matrix per class
+#### What was done
+- MobileNetV2 CNN built using transfer learning (pretrained ImageNet weights)
+- Two-phase training strategy implemented
+  - Phase 1: frozen MobileNetV2 base, trained classification head only (10 epochs)
+  - Phase 2: unfroze top 36 layers (from index 100), fine-tuned with LR=1e-5
+- Mixed precision (float16) enabled for 4 GB VRAM compatibility on RTX 2050
+- GPU memory growth enabled to prevent OOM errors
+- Heavy augmentation on training generator (rotation, flip, brightness, zoom, shear)
+- Class weights computed as safety net for any residual imbalance
+- Model evaluated on 27,000 held-out test images
+- Confusion matrix and training curves saved to `logs/plots/`
 
-#### Target metrics
-| Metric | Target |
+#### Model architecture
+```
+Input (96x96x3)
+    → MobileNetV2 backbone (pretrained ImageNet, top 36 layers unfrozen)
+    → GlobalAveragePooling2D
+    → Dense(256) + BatchNorm + ReLU + Dropout(0.4)
+    → Dense(128) + BatchNorm + ReLU + Dropout(0.3)
+    → Dense(3, softmax)   [float32 cast for mixed precision stability]
+```
+
+#### Training progression
+| Phase | Epochs | Best Val Accuracy | Notes |
+|---|---|---|---|
+| Phase 1 (frozen base) | 10 | 86.99% | Head-only training |
+| Phase 2 (fine-tuning) | 4 of 25 | **93.05%** | Interrupted, resumed from checkpoint |
+| Phase 2 resume | +4 epochs | **96.19% (test)** | EarlyStopping triggered |
+
+#### Final test set results (27,000 images)
+| Metric | Result | Target | Status |
+|---|---|---|---|
+| Overall accuracy | **96.19%** | >90% | ✅ PASS |
+| Yawn recall | **97.32%** | >85% | ✅ PASS |
+| closed_eye F1 | 96.57% | — | ✅ |
+| open_eye F1 | 94.23% | — | ✅ |
+| yawn F1 | 97.76% | — | ✅ |
+
+#### Per-class results
+| Class | Precision | Recall | F1 | Support |
+|---|---|---|---|---|
+| closed_eye | 95.08% | 98.10% | 96.57% | 9,000 |
+| open_eye | 95.33% | 93.16% | 94.23% | 9,000 |
+| yawn | 98.21% | 97.32% | 97.76% | 9,000 |
+
+#### Confusion matrix (raw counts)
+| Actual \ Predicted | closed_eye | open_eye | yawn |
+|---|---|---|---|
+| closed_eye | **8,829** | 170 | 1 |
+| open_eye | 457 | **8,384** | 159 |
+| yawn | 0 | 241 | **8,759** |
+
+#### Confidence analysis
+| Class | Mean confidence | Min | Max |
+|---|---|---|---|
+| closed_eye | 96.05% | 2.20% | 100% |
+| open_eye | 91.87% | 0.01% | 100% |
+| yawn | 96.62% | 0.19% | 100% |
+
+Low-confidence predictions (<70%): 1,023 / 27,000 (3.8%)
+These will trigger uncertainty handling in Day 3 real-time detection.
+
+#### Scripts created
+| Script | Purpose |
 |---|---|
-| Training accuracy | > 92% |
-| Validation accuracy | > 90% |
-| Yawn class accuracy | > 85% |
+| `src/train_model.py` | Two-phase MobileNetV2 training with GPU optimizations |
+| `src/evaluate_model.py` | Test set evaluation, confusion matrix, confidence analysis |
+
+#### Issues faced & resolved
+| Issue | Fix |
+|---|---|
+| matplotlib 3.10.x broken install (_c_internal_utils error) | Downgraded to matplotlib==3.9.2 |
+| CosineDecay schedule incompatible with TF 2.15 Adam | Replaced with plain float LR (1e-5), ReduceLROnPlateau handles decay |
+| VS Code closed mid-epoch 5, interrupted Phase 2 | Epoch 4 checkpoint (93.05%) was already saved by ModelCheckpoint — no data lost. Resumed from checkpoint. |
+
+#### Key observations
+- Yawn class achieved highest accuracy (97.76% F1) despite starting with only 38k raw images — Day 1 augmentation was highly effective
+- Main confusion is open_eye ↔ closed_eye (457 misclassifications) — expected for squinting/partial blink edge cases. Will not affect real-time system since alarms require multiple consecutive frames
+- Zero yawn frames misclassified as closed_eye — critical for safety (no false drowsiness alarms from yawning)
+- 3.8% low-confidence frames will be handled gracefully in Day 3 detector logic
 
 ---
 
@@ -187,7 +260,7 @@ Only `main.py` switches between `mode = "virtual"` and `mode = "hardware"`.
 **Status:** 📋 Planned
 
 - MediaPipe face mesh → EAR + MAR calculation
-- Load trained CNN model
+- Load trained CNN model (`drowsiness_model.keras`)
 - Real-time webcam loop
 - Alert manager (pygame alarm)
 - SQLite session + alert logging
@@ -225,6 +298,10 @@ Only `main.py` switches between `mode = "virtual"` and `mode = "hardware"`.
 | YawDD Mirror over Dash | Mirror has clean per-action labels; Dash has mixed behavior |
 | 90k per class target | Enough for strong CNN, avoids overfitting, balanced |
 | Dual mode design | Same codebase runs on webcam and Raspberry Pi hardware |
+| img_size=96x96, batch=16 | Fits within 4 GB VRAM with mixed precision on RTX 2050 |
+| Two-phase training | Phase 1 warms up head fast; Phase 2 fine-tunes for max accuracy |
+| Mixed precision (float16) | Reduces VRAM ~40%, speeds up RTX training with no accuracy loss |
+| Unfreeze from layer 100 | Top 36 MobileNetV2 layers fine-tuned; lower layers keep ImageNet features |
 
 ---
 
@@ -239,4 +316,4 @@ When switching to hardware mode:
 ---
 
 *Log maintained by: Austin Trinidad*
-*Last updated: Day 1 — 2026-03-15*
+*Last updated: Day 2 — 2026-03-18*
