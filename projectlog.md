@@ -25,9 +25,9 @@ Both modes share the same CNN model, database, and alert logic. Only the input/o
 | Model evaluation | scikit-learn |
 | Data processing | NumPy, Pandas |
 | Visualization | Matplotlib |
-| Alert sound | Pygame |
+| Alert sound | Pygame (synthesized beep — no wav file needed) |
 | Database | SQLite (built-in) |
-| Hardware mode | RPi.GPIO / picamera2 (optional) |
+| Hardware mode | RPi.GPIO / picamera2 (Day 4) |
 
 ---
 
@@ -38,10 +38,21 @@ Driver_Drowsiness_System/
 ├── projectlog.md
 ├── requirements.txt
 ├── README.md
+├── main.py                        # Day 3 ✅ entry point, virtual/hardware mode switch
 ├── drowsiness.db                  # SQLite database (auto-created)
 │
+├── core/                          # Day 3 ✅
+│   ├── __init__.py
+│   ├── detector.py                # EAR / MAR / CNN / fusion logic
+│   ├── alert_manager.py           # beep + OpenCV overlay + DB logging
+│   └── session_manager.py         # session start/end/frame logging
+│
+├── database/                      # Day 3 ✅
+│   ├── __init__.py
+│   └── db_queries.py              # CRUD helpers for SQLite
+│
 ├── src/
-│   ├── db_setup.py                # Day 1 ✅
+│   ├── db_setup.py                # Day 1 ✅ (updated Day 3)
 │   ├── split_dataset.py           # Day 1 ✅
 │   ├── balance_dataset.py         # Day 1 ✅
 │   ├── extract_yawdd_frames_v2.py # Day 1 ✅
@@ -50,26 +61,18 @@ Driver_Drowsiness_System/
 │   ├── train_model.py             # Day 2 ✅
 │   └── evaluate_model.py          # Day 2 ✅
 │
-├── core/                          # Day 3+
-│   ├── detector.py                # EAR / MAR / head pose logic
-│   ├── alert_manager.py           # alarm + DB logging
-│   └── session_manager.py         # session start/end
-│
-├── database/
-│   └── db_queries.py              # CRUD helpers (Day 3+)
-│
 ├── models/
 │   ├── drowsiness_model.keras     # Day 2 ✅ final trained model (96.19% test acc)
-│   └── phase1_best.keras          # Day 2 ✅ Phase 1 checkpoint (86.99% val acc)
+│   └── phase1_best.keras          # Day 2 ✅ Phase 1 checkpoint
 │
 ├── logs/
 │   ├── training/                  # TensorBoard logs + CSV training log
 │   └── plots/
-│       ├── training_curves.png    # Day 2 ✅ accuracy + loss curves
-│       └── confusion_matrix.png   # Day 2 ✅ per-class confusion matrix
+│       ├── training_curves.png    # Day 2 ✅
+│       └── confusion_matrix.png   # Day 2 ✅
 │
 ├── data/
-│   └── alarm.wav                  # alert sound file
+│   └── alarm.wav                  # optional — system uses synthesized beep
 │
 └── dataset/                       # gitignored — local only
     ├── train/      → 216,000 images
@@ -81,17 +84,19 @@ Driver_Drowsiness_System/
 
 ## Mode Architecture
 
-### Virtual Mode (webcam)
+### Virtual Mode (webcam) — Day 3 ✅
 ```
-Webcam (OpenCV)
+Webcam (OpenCV, auto-detect)
     → MediaPipe Face Mesh (468 landmarks)
-    → EAR / MAR / Head Pose calculation
-    → CNN model prediction
-    → Alert Manager (pygame alarm)
-    → SQLite logging
+    → EAR / MAR calculation
+    → CNN model inference (direct call, no data pipeline)
+    → Fusion logic (EAR + CNN combined decision)
+    → Frame counter (30 consecutive drowsy frames → alarm)
+    → Alert Manager (synthesized beep + OpenCV overlay)
+    → SQLite logging (sessions, alerts, frame_logs)
 ```
 
-### Hardware Mode (Raspberry Pi / sensors)
+### Hardware Mode (Raspberry Pi) — Day 4 planned
 ```
 Pi Camera / IR Camera
     → MediaPipe Face Mesh
@@ -140,16 +145,6 @@ Only `main.py` switches between `mode = "virtual"` and `mode = "hardware"`.
 | test | 9,000 | 9,000 | 9,000 | 27,000 |
 | **total** | **90,000** | **90,000** | **90,000** | **270,000** |
 
-#### Database state
-| Table | Rows |
-|---|---|
-| drivers | 1 (Test Driver) |
-| sessions | 0 |
-| alerts | 0 |
-| frame_logs | 0 |
-| config | 7 |
-| migrations | 1 |
-
 #### Scripts created
 | Script | Purpose |
 |---|---|
@@ -181,7 +176,6 @@ Only `main.py` switches between `mode = "virtual"` and `mode = "hardware"`.
 - Mixed precision (float16) enabled for 4 GB VRAM compatibility on RTX 2050
 - GPU memory growth enabled to prevent OOM errors
 - Heavy augmentation on training generator (rotation, flip, brightness, zoom, shear)
-- Class weights computed as safety net for any residual imbalance
 - Model evaluated on 27,000 held-out test images
 - Confusion matrix and training curves saved to `logs/plots/`
 
@@ -195,13 +189,6 @@ Input (96x96x3)
     → Dense(3, softmax)   [float32 cast for mixed precision stability]
 ```
 
-#### Training progression
-| Phase | Epochs | Best Val Accuracy | Notes |
-|---|---|---|---|
-| Phase 1 (frozen base) | 10 | 86.99% | Head-only training |
-| Phase 2 (fine-tuning) | 4 of 25 | **93.05%** | Interrupted, resumed from checkpoint |
-| Phase 2 resume | +4 epochs | **96.19% (test)** | EarlyStopping triggered |
-
 #### Final test set results (27,000 images)
 | Metric | Result | Target | Status |
 |---|---|---|---|
@@ -210,30 +197,6 @@ Input (96x96x3)
 | closed_eye F1 | 96.57% | — | ✅ |
 | open_eye F1 | 94.23% | — | ✅ |
 | yawn F1 | 97.76% | — | ✅ |
-
-#### Per-class results
-| Class | Precision | Recall | F1 | Support |
-|---|---|---|---|---|
-| closed_eye | 95.08% | 98.10% | 96.57% | 9,000 |
-| open_eye | 95.33% | 93.16% | 94.23% | 9,000 |
-| yawn | 98.21% | 97.32% | 97.76% | 9,000 |
-
-#### Confusion matrix (raw counts)
-| Actual \ Predicted | closed_eye | open_eye | yawn |
-|---|---|---|---|
-| closed_eye | **8,829** | 170 | 1 |
-| open_eye | 457 | **8,384** | 159 |
-| yawn | 0 | 241 | **8,759** |
-
-#### Confidence analysis
-| Class | Mean confidence | Min | Max |
-|---|---|---|---|
-| closed_eye | 96.05% | 2.20% | 100% |
-| open_eye | 91.87% | 0.01% | 100% |
-| yawn | 96.62% | 0.19% | 100% |
-
-Low-confidence predictions (<70%): 1,023 / 27,000 (3.8%)
-These will trigger uncertainty handling in Day 3 real-time detection.
 
 #### Scripts created
 | Script | Purpose |
@@ -244,37 +207,88 @@ These will trigger uncertainty handling in Day 3 real-time detection.
 #### Issues faced & resolved
 | Issue | Fix |
 |---|---|
-| matplotlib 3.10.x broken install (_c_internal_utils error) | Downgraded to matplotlib==3.9.2 |
-| CosineDecay schedule incompatible with TF 2.15 Adam | Replaced with plain float LR (1e-5), ReduceLROnPlateau handles decay |
-| VS Code closed mid-epoch 5, interrupted Phase 2 | Epoch 4 checkpoint (93.05%) was already saved by ModelCheckpoint — no data lost. Resumed from checkpoint. |
-
-#### Key observations
-- Yawn class achieved highest accuracy (97.76% F1) despite starting with only 38k raw images — Day 1 augmentation was highly effective
-- Main confusion is open_eye ↔ closed_eye (457 misclassifications) — expected for squinting/partial blink edge cases. Will not affect real-time system since alarms require multiple consecutive frames
-- Zero yawn frames misclassified as closed_eye — critical for safety (no false drowsiness alarms from yawning)
-- 3.8% low-confidence frames will be handled gracefully in Day 3 detector logic
+| matplotlib 3.10.x broken install | Downgraded to matplotlib==3.9.2 |
+| CosineDecay incompatible with TF 2.15 Adam | Replaced with plain float LR, ReduceLROnPlateau handles decay |
+| VS Code closed mid-epoch 5 | Epoch 4 checkpoint (93.05%) already saved — resumed from there |
 
 ---
 
-### Day 3 — Real-time Detection (planned)
-**Status:** 📋 Planned
+### Day 3 — Real-time Detection (Virtual Mode)
+**Date:** 2026-03-19
+**Status:** ✅ Complete
 
-- MediaPipe face mesh → EAR + MAR calculation
-- Load trained CNN model (`drowsiness_model.keras`)
-- Real-time webcam loop
-- Alert manager (pygame alarm)
-- SQLite session + alert logging
-- Virtual mode complete
+#### What was done
+- Full real-time detection pipeline built and tested on laptop webcam
+- MediaPipe FaceMesh (468 landmarks) for EAR + MAR calculation
+- CNN inference integrated using direct model call (`model(img, training=False)`) for real-time performance
+- Fusion logic combining EAR and CNN — requires both to agree on eye closure (eliminates false positives)
+- Frame counter with gradual decay — 30 consecutive drowsy frames (~1 sec) before alarm fires
+- Synthesized beep alert generated in code using numpy + pygame (no wav file needed)
+- OpenCV overlay showing EAR, MAR, CNN class + confidence bar, drowsy frame progress bar
+- Auto camera detection — tries indices 0, 1, 2 automatically
+- Full SQLite logging — sessions, per-alert records, per-frame metrics (throttled every 15 frames)
+- DB schema updated to match Day 3 column names (start_time, end_time, timestamp, cnn_class, cnn_confidence)
+
+#### Detection architecture (per frame)
+```
+Webcam frame
+    → MediaPipe → 468 landmarks
+    → EAR (avg left + right eye)
+    → MAR (mouth open ratio)
+    → CNN face crop → model(img) → [closed_eye, open_eye, yawn] probabilities
+    → Fusion: (CNN closed_eye AND EAR < 0.20) → combined alert
+              (EAR < 0.20 alone)              → eye closure alert
+              (CNN yawn OR MAR > 0.60)        → yawn alert
+    → Frame counter (30 frames sustained) → trigger alarm
+    → AlertManager: beep + overlay + DB log
+```
+
+#### Final calibrated thresholds
+| Parameter | Initial | Final | Reason |
+|---|---|---|---|
+| `EAR_THRESHOLD` | 0.25 | 0.20 | Natural open-eye EAR was ~0.30+ |
+| `CNN_THRESHOLD` | 0.70 | 0.85 | Reduce CNN false positives |
+| `FRAME_THRESHOLD` | 20 | 30 | ~1 sec sustained closure needed |
+| Frame counter decay | -1/frame | -3/frame | Fast reset after blinks |
+| CNN-alone eye rule | enabled | removed | EAR is ground truth for eyes |
+
+#### Test results
+| Session | Frames | Eyes open alerts | Eyes closed alerts | Result |
+|---|---|---|---|---|
+| Initial (no tuning) | 155 | 17 false alerts | — | ❌ Too sensitive |
+| After EAR/CNN fix | 499 | 0 false alerts | 2 real detections | ✅ |
+| Final calibrated | 632 | 0 false alerts | 2 real detections | ✅ Perfect |
+
+#### Files created
+| File | Purpose |
+|---|---|
+| `main.py` | Entry point — virtual/hardware mode switch, camera auto-detect, main loop |
+| `core/detector.py` | EAR + MAR calculation, CNN inference, fusion logic, frame counter |
+| `core/alert_manager.py` | Synthesized beep, OpenCV overlay, DB alert logging |
+| `core/session_manager.py` | Session lifecycle — start, frame throttle, end |
+| `database/db_queries.py` | All SQLite CRUD operations |
+| `src/db_setup.py` | Updated schema with Day 3 column names |
+
+#### Issues faced & resolved
+| Issue | Fix |
+|---|---|
+| protobuf version conflict (mediapipe ImportError) | `pip install protobuf==3.20.3` |
+| DB tables missing on first run | Run `python src/db_setup.py` first |
+| DB column name mismatch (Day 1 vs Day 3) | Deleted old DB, updated db_setup.py schema to match db_queries.py |
+| `model.predict()` crash in tight loop | Replaced with `model(img, training=False).numpy()` — direct call, no data pipeline |
+| Pygame beep error "Array must be 2D for stereo" | Changed mixer to stereo, used `np.column_stack([mono, mono])` for stereo array |
+| False alerts with eyes open (EAR ~0.30) | Lowered EAR_THRESHOLD to 0.20, raised CNN_THRESHOLD to 0.85 |
+| Alert #5/#6 "NONE" type still firing | Increased frame decay from -1 to -3, removed CNN-alone eye closure rule |
 
 ---
 
 ### Day 4 — Hardware Mode (planned)
 **Status:** 📋 Planned
 
-- Raspberry Pi camera integration
+- Raspberry Pi camera integration (picamera2)
 - GPIO buzzer + LED alerts
-- Same core/ logic as virtual mode
-- Test on Pi hardware
+- Same core/ logic as virtual mode — zero changes to detector.py
+- Only main.py switches I/O layer
 
 ---
 
@@ -301,14 +315,17 @@ These will trigger uncertainty handling in Day 3 real-time detection.
 | img_size=96x96, batch=16 | Fits within 4 GB VRAM with mixed precision on RTX 2050 |
 | Two-phase training | Phase 1 warms up head fast; Phase 2 fine-tunes for max accuracy |
 | Mixed precision (float16) | Reduces VRAM ~40%, speeds up RTX training with no accuracy loss |
-| Unfreeze from layer 100 | Top 36 MobileNetV2 layers fine-tuned; lower layers keep ImageNet features |
+| model() over model.predict() | Direct call avoids Keras data pipeline — safe in real-time loops |
+| EAR as ground truth for eyes | CNN can misfire on lighting/crop; EAR is geometry-based and reliable |
+| Synthesized beep over wav file | No file dependency — tone generated in memory with numpy + pygame |
+| CNN-alone eye rule removed | Fusion requires EAR + CNN agreement — eliminates false positives |
 
 ---
 
-## Hardware Mode Notes (future reference)
+## Hardware Mode Notes (Day 4 reference)
 When switching to hardware mode:
 - Replace `cv2.VideoCapture(0)` with `picamera2` stream
-- Replace `pygame.mixer` alarm with `RPi.GPIO` buzzer on pin X
+- Replace `pygame.mixer` beep with `RPi.GPIO` buzzer on pin X
 - Add LED indicator on GPIO pin Y
 - SQLite DB path changes to `/home/pi/drowsiness.db`
 - All `core/` files remain identical — zero changes needed
@@ -316,4 +333,4 @@ When switching to hardware mode:
 ---
 
 *Log maintained by: Austin Trinidad*
-*Last updated: Day 2 — 2026-03-18*
+*Last updated: Day 3 — 2026-03-19*
