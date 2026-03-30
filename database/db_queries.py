@@ -1,18 +1,7 @@
-"""
-database/db_queries.py
-======================
-Day 3 — SQLite CRUD helpers
-Driver Drowsiness Detection System
-
-All database read/write operations go through here.
-Used by session_manager.py and alert_manager.py.
-
-Author: Austin Trinidad
-"""
-
 import sqlite3
 import os
 from datetime import datetime
+from typing import Optional, Dict, Any
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH  = os.path.join(BASE_DIR, "drowsiness.db")
@@ -22,7 +11,8 @@ def get_connection():
     """Return a SQLite connection with row_factory for dict-like access."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")  # safer for concurrent writes
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys = ON") # Ensure FK constraints are active
     return conn
 
 
@@ -57,26 +47,85 @@ def set_config(key: str, value: str):
 
 
 # ─────────────────────────────────────────────
-# DRIVERS
+# DRIVERS & PROFILES (Day 4)
 # ─────────────────────────────────────────────
 
 def get_or_create_driver(name: str = "Default Driver") -> int:
-    """Return driver_id for the given name, creating if not exists."""
+    """Return driver_id, creating driver and profile if not exists."""
     try:
         with get_connection() as conn:
             row = conn.execute(
                 "SELECT id FROM drivers WHERE name = ?", (name,)
             ).fetchone()
+            
             if row:
                 return row["id"]
+            
+            # Create driver
             cursor = conn.execute(
                 "INSERT INTO drivers (name, created_at) VALUES (?, ?)",
                 (name, datetime.now().isoformat())
             )
-            return cursor.lastrowid
+            driver_id = cursor.lastrowid
+            
+            # Create associated profile
+            conn.execute(
+                "INSERT INTO driver_profiles (driver_id) VALUES (?)",
+                (driver_id,)
+            )
+            return driver_id
     except Exception as e:
         print(f"[DB] get_or_create_driver error: {e}")
-        return 1  # fallback to driver id 1
+        return 1
+
+
+def get_driver_profile(driver_id: int) -> Optional[Dict[str, Any]]:
+    """Fetch sensitivity and trust data for a driver."""
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM driver_profiles WHERE driver_id = ?", (driver_id,)
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        print(f"[DB] get_driver_profile error: {e}")
+        return None
+
+
+def update_driver_profile(driver_id: int, sensitivity: float = None, trust: float = None):
+    """Update profile metrics after a session or alert event."""
+    try:
+        with get_connection() as conn:
+            if sensitivity is not None:
+                conn.execute("UPDATE driver_profiles SET sensitivity_modifier = ?, updated_at = ? WHERE driver_id = ?",
+                             (sensitivity, datetime.now().isoformat(), driver_id))
+            if trust is not None:
+                conn.execute("UPDATE driver_profiles SET trust_index = ?, updated_at = ? WHERE driver_id = ?",
+                             (trust, datetime.now().isoformat(), driver_id))
+    except Exception as e:
+        print(f"[DB] update_driver_profile error: {e}")
+
+
+# ─────────────────────────────────────────────
+# FATIGUE EVENTS (Day 4)
+# ─────────────────────────────────────────────
+
+def log_fatigue_event(driver_id: int, level: int, score: float, circadian_label: str = None):
+    """
+    Log a high-level fatigue event.
+    level: 1-5 (Scale of fatigue severity)
+    score: Calculated fatigue probability
+    """
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                """INSERT INTO fatigue_events 
+                   (driver_id, fatigue_level, fatigue_score, circadian_label, timestamp)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (driver_id, level, round(score, 4), circadian_label, datetime.now().isoformat())
+            )
+    except Exception as e:
+        print(f"[DB] log_fatigue_event error: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -113,16 +162,11 @@ def end_session(session_id: int, total_alerts: int):
 
 
 # ─────────────────────────────────────────────
-# ALERTS
+# ALERTS & FRAME LOGS
 # ─────────────────────────────────────────────
 
 def log_alert(session_id: int, alert_type: str, ear: float, mar: float,
               cnn_class: str, cnn_confidence: float):
-    """
-    Log a single drowsiness alert event.
-
-    alert_type: 'closed_eye' | 'yawn' | 'combined'
-    """
     try:
         with get_connection() as conn:
             conn.execute(
@@ -137,16 +181,8 @@ def log_alert(session_id: int, alert_type: str, ear: float, mar: float,
         print(f"[DB] log_alert error: {e}")
 
 
-# ─────────────────────────────────────────────
-# FRAME LOGS
-# ─────────────────────────────────────────────
-
 def log_frame(session_id: int, ear: float, mar: float,
               cnn_class: str, cnn_confidence: float, is_drowsy: bool):
-    """
-    Log per-frame detection data.
-    Only called every N frames to avoid flooding the DB.
-    """
     try:
         with get_connection() as conn:
             conn.execute(
@@ -163,11 +199,10 @@ def log_frame(session_id: int, ear: float, mar: float,
 
 
 # ─────────────────────────────────────────────
-# STATS (for future dashboard)
+# STATS
 # ─────────────────────────────────────────────
 
 def get_session_summary(session_id: int) -> dict:
-    """Return alert count and duration for a session."""
     try:
         with get_connection() as conn:
             row = conn.execute(
@@ -175,9 +210,7 @@ def get_session_summary(session_id: int) -> dict:
                    FROM sessions WHERE id = ?""",
                 (session_id,)
             ).fetchone()
-            if row:
-                return dict(row)
-            return {}
+            return dict(row) if row else {}
     except Exception as e:
         print(f"[DB] get_session_summary error: {e}")
         return {}

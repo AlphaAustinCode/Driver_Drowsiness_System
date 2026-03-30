@@ -1,17 +1,3 @@
-"""
-core/alert_manager.py
-=====================
-Day 3 — Alert Manager
-Driver Drowsiness Detection System
-
-Handles all alert outputs when drowsiness is detected:
-  1. Beep sound (generated in code — no wav file needed)
-  2. Visual overlay on OpenCV frame (red flash + warning text)
-  3. SQLite alert logging via db_queries
-
-Author: Austin Trinidad
-"""
-
 import sys
 import os
 import time
@@ -25,12 +11,11 @@ from database.db_queries import log_alert
 
 class AlertManager:
     """
-    Manages drowsiness alerts — sound, visual, and DB logging.
-
-    Usage:
-        am = AlertManager(session_id=1)
-        am.trigger(ear, mar, cnn_class, cnn_confidence, alert_type)
-        am.draw_overlay(frame, status, ear, mar, cnn_class, cnn_confidence, frame_counter, threshold)
+    Manages drowsiness alerts with graduated audio responses.
+    Levels: 
+      - low: Mild fatigue (two mid-pitch beeps)
+      - high: High fatigue (triple fast beep)
+      - critical: Emergency (siren effect)
     """
 
     # Cooldown between consecutive alerts (seconds)
@@ -47,7 +32,6 @@ class AlertManager:
         """Initialize pygame mixer for beep generation."""
         try:
             import pygame
-            # channels=2 for stereo — numpy array must be 2D (n_samples, 2)
             pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
             self._pygame = pygame
             return True
@@ -56,16 +40,11 @@ class AlertManager:
             return False
 
     # ─────────────────────────────────────────────
-    # SOUND
+    # SOUND GENERATION
     # ─────────────────────────────────────────────
 
     def _generate_beep(self, frequency: int = 880, duration_ms: int = 800):
-        """
-        Generate and play a beep tone using numpy + pygame.
-        No wav file needed — tone synthesized in memory.
-
-        Stereo fix: pygame stereo mixer requires shape (n_samples, 2).
-        """
+        """Synthesize a sine wave tone in memory."""
         if not self._pygame_ok:
             return
         try:
@@ -73,7 +52,6 @@ class AlertManager:
             n_samples   = int(sample_rate * duration_ms / 1000)
             t           = np.linspace(0, duration_ms / 1000, n_samples, False)
 
-            # Sine wave with attack/decay envelope
             wave     = np.sin(2 * np.pi * frequency * t)
             envelope = np.ones(n_samples)
             attack   = int(sample_rate * 0.01)
@@ -81,10 +59,7 @@ class AlertManager:
             envelope[:attack]  = np.linspace(0, 1, attack)
             envelope[-decay:]  = np.linspace(1, 0.3, decay)
 
-            # Mono samples scaled to int16
             mono = (wave * envelope * 32767).astype(np.int16)
-
-            # Stereo: duplicate mono into shape (n_samples, 2)
             stereo = np.column_stack([mono, mono])
 
             sound = self._pygame.sndarray.make_sound(stereo)
@@ -93,18 +68,39 @@ class AlertManager:
         except Exception as e:
             print(f"[ALERT] Beep error: {e}")
 
-    def _play_alert_sound(self):
-        """Play double-beep pattern."""
-        self._generate_beep(frequency=880,  duration_ms=300)
-        time.sleep(0.15)
-        self._generate_beep(frequency=1050, duration_ms=400)
+    # ─────────────────────────────────────────────
+    # GRADUATED AUDIO LOGIC
+    # ─────────────────────────────────────────────
 
-    def _play_sound_async(self):
+    def _play_alert_sound(self, priority: str):
+        """Play different beep patterns based on danger level."""
+        if priority == "low":
+            # Level 1: Mild Fatigue -> Two short, mid-pitch beeps
+            self._generate_beep(frequency=600, duration_ms=200)
+            time.sleep(0.1)
+            self._generate_beep(frequency=600, duration_ms=200)
+            
+        elif priority == "high":
+            # Level 2: High Fatigue -> Loud, fast triple beep
+            for _ in range(3):
+                self._generate_beep(frequency=900, duration_ms=250)
+                time.sleep(0.1)
+                
+        elif priority == "critical":
+            # Level 3: Critical Fatigue -> Continuous high-pitch siren effect
+            for _ in range(5):
+                self._generate_beep(frequency=1200, duration_ms=400)
+                time.sleep(0.05)
+        else:
+            # Fallback (e.g., general yawning)
+            self._generate_beep(frequency=880, duration_ms=300)
+
+    def _play_sound_async(self, priority: str):
         """Trigger sound in background — doesn't block video loop."""
         if self._sound_thread is not None and self._sound_thread.is_alive():
-            return  # don't stack sounds
+            return 
         self._sound_thread = threading.Thread(
-            target=self._play_alert_sound, daemon=True
+            target=self._play_alert_sound, args=(priority,), daemon=True
         )
         self._sound_thread.start()
 
@@ -116,7 +112,7 @@ class AlertManager:
                 cnn_class: str, cnn_confidence: float, alert_type: str):
         """
         Fire an alert if cooldown has passed.
-        Plays sound + logs to DB.
+        Passes priority level to the async sound player.
         """
         now = time.time()
         if now - self.last_alert_time < self.ALERT_COOLDOWN:
@@ -125,7 +121,8 @@ class AlertManager:
         self.last_alert_time = now
         self.alert_count    += 1
 
-        self._play_sound_async()
+        # Passes priority level ('low', 'high', 'critical') to the sound system
+        self._play_sound_async(priority=alert_type)
 
         if self.session_id and self.session_id > 0:
             log_alert(
@@ -146,19 +143,16 @@ class AlertManager:
     # ─────────────────────────────────────────────
 
     def draw_overlay(self, frame: np.ndarray,
-                     status: str,
-                     ear: float,
-                     mar: float,
-                     cnn_class: str,
-                     cnn_confidence: float,
-                     frame_counter: int,
-                     frame_threshold: int) -> np.ndarray:
-        """
-        Draw live info panel + status banner onto the OpenCV frame.
-        Returns the annotated frame.
-        """
+                      status: str,
+                      ear: float,
+                      mar: float,
+                      cnn_class: str,
+                      cnn_confidence: float,
+                      frame_counter: int,
+                      frame_threshold: int) -> np.ndarray:
+        """Draw live info panel + status banner onto the OpenCV frame."""
         h, w   = frame.shape[:2]
-        is_alert = status.startswith("ALERT") or status == "DROWSY"
+        is_alert = any(x in status for x in ["ALERT", "DROWSY", "CRITICAL", "HIGH", "LOW"])
 
         # ── Status banner (top) ──
         if status == "NO_FACE":
@@ -167,15 +161,10 @@ class AlertManager:
         elif is_alert:
             flash        = int(time.time() * 2) % 2 == 0
             banner_color = (0, 0, 220) if flash else (0, 0, 160)
-            label_map    = {
-                "ALERT":      "DROWSINESS DETECTED",
-                "ALERT_YAWN": "YAWNING DETECTED",
-                "DROWSY":     "EYES CLOSING",
-            }
-            banner_text = label_map.get(status, "ALERT")
+            banner_text  = f"WARNING: {status.upper()}"
         else:
             banner_color = (30, 160, 30)
-            banner_text  = "ALERT"
+            banner_text  = "SYSTEM ACTIVE"
 
         cv2.rectangle(frame, (0, 0), (w, 50), banner_color, -1)
         cv2.putText(frame, banner_text,
@@ -194,60 +183,20 @@ class AlertManager:
         fsmall = 0.52
         line_h = 26
 
-        # EAR
-        ear_color = (50, 50, 220) if ear < 0.25 else (50, 220, 50)
-        cv2.putText(frame, f"EAR: {ear:.3f}",
-                    (panel_x, panel_y + line_h * 0),
-                    font, fsmall, ear_color, 1, cv2.LINE_AA)
-
-        # MAR
-        mar_color = (50, 180, 220) if mar > 0.6 else (50, 220, 50)
-        cv2.putText(frame, f"MAR: {mar:.3f}",
-                    (panel_x, panel_y + line_h * 1),
-                    font, fsmall, mar_color, 1, cv2.LINE_AA)
-
-        # CNN class + confidence
-        cnn_color_map = {
-            "closed_eye": (50,  50,  220),
-            "yawn":       (50,  180, 220),
-            "open_eye":   (50,  220, 50),
-        }
-        cnn_color = cnn_color_map.get(cnn_class, (200, 200, 200))
-        cv2.putText(frame, f"CNN: {cnn_class} {cnn_confidence:.0%}",
-                    (panel_x, panel_y + line_h * 2),
-                    font, fsmall, cnn_color, 1, cv2.LINE_AA)
-
-        # Confidence bar
-        bar_x         = panel_x
-        bar_y         = panel_y + line_h * 3 - 8
-        bar_w_total   = 200
-        bar_w_filled  = int(bar_w_total * cnn_confidence)
-        cv2.rectangle(frame, (bar_x, bar_y),
-                      (bar_x + bar_w_total, bar_y + 8), (60, 60, 60), -1)
-        cv2.rectangle(frame, (bar_x, bar_y),
-                      (bar_x + bar_w_filled, bar_y + 8), cnn_color, -1)
+        # EAR & MAR Stats
+        cv2.putText(frame, f"EAR: {ear:.3f}", (panel_x, panel_y + line_h * 0), font, fsmall, (255, 255, 255), 1)
+        cv2.putText(frame, f"MAR: {mar:.3f}", (panel_x, panel_y + line_h * 1), font, fsmall, (255, 255, 255), 1)
+        
+        # CNN Confidence
+        cv2.putText(frame, f"CNN: {cnn_class} {cnn_confidence:.0%}", (panel_x, panel_y + line_h * 2), font, fsmall, (0, 255, 255), 1)
 
         # Drowsy frame counter
         safe_threshold = max(frame_threshold, 1)
         progress       = min(frame_counter / safe_threshold, 1.0)
-        bar_w2         = int(bar_w_total * progress)
-        prog_color     = (0, 0, 220) if progress > 0.7 else \
-                         (0, 165, 255) if progress > 0.4 else (0, 220, 0)
-        cv2.putText(frame, f"Drowsy frames: {frame_counter}/{frame_threshold}",
-                    (panel_x, panel_y + line_h * 3 + 16),
-                    font, fsmall, (200, 200, 200), 1, cv2.LINE_AA)
-        bar_y2 = panel_y + line_h * 4 - 4
-        cv2.rectangle(frame, (bar_x, bar_y2 + 10),
-                      (bar_x + bar_w_total, bar_y2 + 18), (60, 60, 60), -1)
-        cv2.rectangle(frame, (bar_x, bar_y2 + 10),
-                      (bar_x + bar_w2,      bar_y2 + 18), prog_color, -1)
+        cv2.putText(frame, f"Intensity: {frame_counter}/{frame_threshold}", (panel_x, panel_y + line_h * 3 + 16), font, fsmall, (200, 200, 200), 1)
 
         # Alert count + quit hint
-        cv2.putText(frame, f"Alerts: {self.alert_count}",
-                    (w - 110, h - 15),
-                    font, fsmall, (200, 200, 200), 1, cv2.LINE_AA)
-        cv2.putText(frame, "Q = quit",
-                    (w - 90, 40),
-                    font, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Alerts: {self.alert_count}", (w - 110, h - 15), font, fsmall, (200, 200, 200), 1)
+        cv2.putText(frame, "Q = quit", (w - 90, 40), font, 0.45, (180, 180, 180), 1)
 
         return frame

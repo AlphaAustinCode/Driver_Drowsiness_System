@@ -1,14 +1,3 @@
-"""
-db_setup.py — Day 1 (updated Day 3): Database Setup
-Driver Drowsiness Detection System
-SQLite | Schema + Indexes + Seed Data + Migration Support
-
-Updated column names to match Day 3 db_queries.py:
-  sessions  : started_at → start_time, ended_at → end_time
-  alerts    : frame_timestamp → timestamp, added cnn_class, cnn_confidence
-  frame_logs: captured_at → timestamp, ear/mar → ear_value/mar_value, added cnn_class/cnn_confidence
-"""
-
 import sqlite3
 import os
 from datetime import datetime
@@ -17,7 +6,7 @@ from datetime import datetime
 # CONFIG
 # ──────────────────────────────────────────────
 DB_PATH        = "drowsiness.db"
-SCHEMA_VERSION = 2  # bumped from Day 1 v1
+SCHEMA_VERSION = 3  # Bumped for Day 4 additions
 
 
 # ──────────────────────────────────────────────
@@ -79,6 +68,24 @@ CREATE TABLE IF NOT EXISTS frame_logs (
     is_drowsy       INTEGER NOT NULL DEFAULT 0
 );
 
+-- ── driver_profiles (Day 4) ──────────────────
+CREATE TABLE IF NOT EXISTS driver_profiles (
+    driver_id             INTEGER PRIMARY KEY REFERENCES drivers(id) ON DELETE CASCADE,
+    sensitivity_modifier  REAL NOT NULL DEFAULT 1.0,
+    trust_index           REAL NOT NULL DEFAULT 100.0,
+    updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ── fatigue_events (Day 4) ───────────────────
+CREATE TABLE IF NOT EXISTS fatigue_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    driver_id        INTEGER NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+    fatigue_level    INTEGER NOT NULL,
+    fatigue_score    REAL NOT NULL,
+    circadian_label  TEXT,
+    timestamp        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- ── config ───────────────────────────────────
 CREATE TABLE IF NOT EXISTS config (
     key             TEXT PRIMARY KEY,
@@ -107,6 +114,7 @@ CREATE INDEX IF NOT EXISTS idx_alerts_type        ON alerts(alert_type);
 CREATE INDEX IF NOT EXISTS idx_alerts_timestamp   ON alerts(timestamp);
 CREATE INDEX IF NOT EXISTS idx_frame_logs_session ON frame_logs(session_id);
 CREATE INDEX IF NOT EXISTS idx_frame_logs_drowsy  ON frame_logs(is_drowsy);
+CREATE INDEX IF NOT EXISTS idx_fatigue_driver     ON fatigue_events(driver_id);
 """
 
 
@@ -149,11 +157,20 @@ def seed_data(conn: sqlite3.Connection):
 MIGRATIONS = [
     (1, "Initial schema (Day 1)", None),
     (2, "Day 3 schema — aligned column names for real-time detection", None),
+    (3, "Day 4 schema — added driver_profiles and fatigue_events", """
+        INSERT OR IGNORE INTO driver_profiles (driver_id, sensitivity_modifier) 
+        SELECT id, 1.0 FROM drivers;
+    """),
 ]
 
 
 def run_migrations(conn: sqlite3.Connection):
     cur = conn.cursor()
+    # Check if migrations table exists before querying
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='migrations'")
+    if not cur.fetchone():
+        return # Setup script will handle initial table creation
+
     cur.execute("SELECT COALESCE(MAX(version), 0) FROM migrations")
     current_version = cur.fetchone()[0]
 
@@ -184,7 +201,7 @@ def setup_database(db_path: str = DB_PATH, force_reset: bool = False):
         print(f"  Existing database deleted: {db_path}")
 
     print(f"\n{'='*50}")
-    print(f"  Driver Drowsiness DB Setup")
+    print(f"  Driver Drowsiness DB Setup (Day 4)")
     print(f"  DB Path : {os.path.abspath(db_path)}")
     print(f"  Time    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*50}\n")
@@ -216,12 +233,16 @@ def verify_database(db_path: str = DB_PATH):
     conn = get_connection(db_path)
     cur  = conn.cursor()
 
-    tables = ["drivers", "sessions", "alerts", "frame_logs", "config", "migrations"]
+    # Updated list to include new Day 4 tables
+    tables = ["drivers", "sessions", "alerts", "frame_logs", "driver_profiles", "fatigue_events", "config", "migrations"]
     print("\n-- Database Verification --")
     for table in tables:
-        cur.execute(f"SELECT COUNT(*) FROM {table}")
-        count = cur.fetchone()[0]
-        print(f"  {table:<15} -> {count} row(s)")
+        try:
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            count = cur.fetchone()[0]
+            print(f"  {table:<20} -> {count} row(s)")
+        except sqlite3.OperationalError:
+            print(f"  {table:<20} -> NOT FOUND")
 
     print("\n-- Config Values --")
     for row in cur.execute("SELECT key, value, description FROM config"):
