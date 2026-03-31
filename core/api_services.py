@@ -1,15 +1,19 @@
+import os
 import requests
 import threading
 from twilio.rest import Client
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 class APIManager:
     def __init__(self):
-        # ── TWILIO CONFIG (For Step 11) ──
-        # You will get these from your free Twilio Console
-        self.twilio_sid = "AC15cad4afd99d491718eea1580d94c281"
-        self.twilio_auth = "a54ae036218915b68e8b6d991fb61f5d"
-        self.twilio_from = "+12605253575"  # Your Twilio number
-        self.emergency_contact = "+918329754847" # Who gets the text
+        # ── TWILIO CONFIG (Secure - from .env) ──
+        self.twilio_sid = os.getenv('TWILIO_ACCOUNT_SID')
+        self.twilio_auth = os.getenv('TWILIO_AUTH_TOKEN')
+        self.twilio_from = os.getenv('TWILIO_PHONE_NUMBER')
+        self.emergency_contact = os.getenv('EMERGENCY_CONTACT')
         
         self.is_fetching_map = False
         self.last_rest_stop = None
@@ -71,7 +75,7 @@ class APIManager:
 
     def _send_twilio_sms(self, driver_id, score):
         try:
-            if self.twilio_sid == "YOUR_TWILIO_ACCOUNT_SID":
+            if not self.twilio_sid or not self.twilio_auth:
                 print("\n[API] Twilio not configured. Simulating Emergency SMS...")
                 print(f"[API] Text: SOS! Driver {driver_id} is critically fatigued (Score: {score}). Last known location: Calangute, Goa.")
                 return
