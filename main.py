@@ -3,6 +3,7 @@ import os
 import argparse
 import time
 import cv2
+import numpy as np
 from datetime import datetime
 
 # Add the project root to path for imports
@@ -14,15 +15,15 @@ from core.alert_manager     import AlertManager
 from core.session_manager    import SessionManager
 from core.fatigue_classifier import FatigueClassifier 
 from core.trust_engine      import TrustEngine
-# 1. Add the import at the top
 from core.baseline_calibrator import BaselineCalibrator
+from core.cognitive_test    import CognitiveAssistant
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 
 MODEL_PATH  = os.path.join(BASE_DIR, "models", "drowsiness_model.keras")
-WINDOW_NAME = "Driver Drowsiness Detection"
+WINDOW_NAME = "Driver Drowsiness Detection — Day 5"
 DRIVER_NAME = "Default Driver"
 DRIVER_ID   = 1 
 
@@ -42,7 +43,7 @@ def find_camera(forced_index: int = None) -> cv2.VideoCapture:
                       f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
                       f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
                 return cap
-        cap.release()
+        if cap: cap.release()
     print("[CAM] No camera found.")
     sys.exit(1)
 
@@ -76,15 +77,13 @@ def run_virtual_mode(cam_index: int = None):
     detector    = DrowsinessDetector(model_path=MODEL_PATH)
     alert_mgr   = AlertManager(session_id=session.session_id)
 
-    # ── FatigueClassifier (EMA Logic) ────────────────────────────────────────
     classifier  = FatigueClassifier(
         session_start = session_start,
         driver_id     = DRIVER_ID,
     )
 
-    # 2. Initialize it before the while True: loop
-    # ── Baseline Calibrator — NEW Day 5 ──────────────────────────────────────
     calibrator = BaselineCalibrator(driver_id=DRIVER_ID, required_frames=150)
+    cog_assist = CognitiveAssistant()
 
     frame_idx    = 0
     fps_time     = time.time()
@@ -106,35 +105,53 @@ def run_virtual_mode(cam_index: int = None):
             # ── Step 1: Raw detection (EAR / MAR / CNN) ──────────────────────
             result = detector.process_frame(frame)
 
-            # 3. Intercept the frames for CALIBRATION OVERRIDE
-            # ── CALIBRATION OVERRIDE ─────────────────────────────────────────────
+            # ── CALIBRATION OVERRIDE ─────────────────────────────────────────
             if calibrator.is_calibrating and result.get("face_found"):
                 just_finished = calibrator.update(result["ear"], result["mar"])
                 
                 if just_finished:
-                    # Override the system defaults with the newly learned metrics!
                     detector.EAR_THRESHOLD = calibrator.baseline_ear
                     detector.MAR_THRESHOLD = calibrator.baseline_mar
                     
-                    # Update the classifier's "perfectly open" normalization bounds
+                    # Update classifier constants globally
                     import core.fatigue_classifier as fc
                     fc.EAR_OPEN = calibrator.mean_ear
                     fc.MAR_CLOSED = calibrator.mean_mar
                     print(f"[CALIB] SUCCESS: New EAR Threshold set to {detector.EAR_THRESHOLD:.3f}")
                 
-                # Draw the calibration progress bar and skip the rest of the loop
                 frame = calibrator.draw_overlay(frame)
                 cv2.imshow(WINDOW_NAME, frame)
-                
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                if cv2.waitKey(1) & 0xFF == ord("q"): break
                 continue
-            # ─────────────────────────────────────────────────────────────────────
+            # ─────────────────────────────────────────────────────────────────
 
             # ── Step 2: Fatigue classification (Level 0–3) ───────────────────
             result = classifier.classify(result)
 
-            # ── DEBUG: Output to terminal for monitoring ─────────────────────
+            # ── Step 2.5: Cognitive Assistance Logic ─────────────────────────
+            # Trigger Stroop Test at Level 1 (Mild Fatigue)
+            if result.get("fatigue_level") == 1:
+                cog_assist.trigger()
+
+            # Process the outcome of any ongoing or just-finished test
+            test_outcome = cog_assist.pop_result()
+            if test_outcome == "pass":
+                print("[COG] Driver passed Stroop Test! Applying EMA reward.")
+                classifier.apply_cognitive_reward()
+            elif test_outcome in ["fail", "timeout"]:
+                print(f"[COG] Driver {test_outcome}ed! Applying EMA penalty.")
+                classifier.apply_cognitive_penalty()
+                
+                # SPECIAL CASE: If they timeout on a critical level, 
+                # we force an immediate emergency SMS via the alert manager.
+                if result.get("fatigue_level") == 3:
+                     alert_mgr.trigger(
+                        ear=result["ear"], mar=result["mar"],
+                        cnn_class=result["cnn_class"], cnn_confidence=result["cnn_confidence"],
+                        alert_type="critical", fatigue_score=1.0
+                    )
+
+            # ── DEBUG: Console Monitoring ────────────────────────────────────
             ema = getattr(classifier, '_ema_score', 0.0)
             is_drowsy_frame = result.get("is_drowsy", False) or result.get("fatigue_level", 0) > 0
             
@@ -149,16 +166,18 @@ def run_virtual_mode(cam_index: int = None):
 
             # ── Step 3: Alert — Graduated Priority ───────────────────────────
             if result["should_alert"] and result["face_found"]:
-                priority = result.get("level_label", "low").lower()
+                # UPDATED: Pass fatigue_score to trigger for SMS context
+                alert_priority = result.get("level_label", "low").lower()
                 alert_mgr.trigger(
                     ear            = result["ear"],
                     mar            = result["mar"],
                     cnn_class      = result["cnn_class"],
                     cnn_confidence = result["cnn_confidence"],
-                    alert_type     = priority
+                    alert_type     = alert_priority,
+                    fatigue_score  = result.get("fatigue_score", ema) # <── ADDED
                 )
 
-            # ── Step 4: Record Frame to DB ───────────────────────────────────
+            # ── Step 4: Record to DB ─────────────────────────────────────────
             session.record_frame(
                 ear            = result["ear"],
                 mar            = result["mar"],
@@ -180,12 +199,15 @@ def run_virtual_mode(cam_index: int = None):
             )
 
             # Fatigue Badge UI
-            level       = result.get("fatigue_level", 0)
+            level = result.get("fatigue_level", 0)
             level_label = result.get("level_label", "Alert")
             level_colors = {0: (0, 255, 0), 1: (0, 255, 255), 2: (0, 165, 255), 3: (0, 0, 255)}
             
             cv2.putText(frame, f"FATIGUE LEVEL {level}: {level_label}", (10, frame.shape[0] - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, level_colors.get(level, (255,255,255)), 2)
+
+            # Overlay Cognitive Test if active
+            frame = cog_assist.draw_overlay(frame)
 
             # FPS Display
             if frame_idx % 30 == 0:
@@ -208,7 +230,6 @@ def run_virtual_mode(cam_index: int = None):
     cv2.destroyAllWindows()
     detector.release()
     
-    # ── Session Wrap-up ────────────────────────────────────────────────
     session.finish(total_alerts=alert_mgr.alert_count)
     session_end = datetime.now()
 
@@ -226,21 +247,11 @@ def run_virtual_mode(cam_index: int = None):
     except Exception as e:
         print(f"[TRUST] Post-session update failed: {e}")
 
-    print(f"\n" + "="*60)
-    print(f" SESSION SUMMARY ")
-    print(f"="*60)
+    print(f"\n" + "="*60 + f"\n SESSION SUMMARY \n" + "="*60)
     print(f" Total frames   : {total_frames}")
     print(f" Total alerts   : {alert_mgr.alert_count}")
     print(f" Final level    : {classifier.get_current_level()}")
     print("="*60 + "\n")
-
-# ─────────────────────────────────────────────
-# HARDWARE MODE STUB
-# ─────────────────────────────────────────────
-
-def run_hardware_mode():
-    print("[HARDWARE] Hardware mode — coming Day 4 hardware sprint.")
-    sys.exit(0)
 
 # ─────────────────────────────────────────────
 # ENTRY POINT
@@ -255,6 +266,6 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     if args.mode == "hardware":
-        run_hardware_mode()
+        print("[HARDWARE] Hardware mode — starting Day 4 hardware sprint.")
     else:
         run_virtual_mode(cam_index=args.cam)

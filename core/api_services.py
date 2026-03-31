@@ -70,6 +70,7 @@ class APIManager:
 
     def send_emergency_sms_async(self, driver_id, score):
         """Spawns a background thread to send an SOS text."""
+        print(f"\n[API THREAD] Launching SMS thread for Driver {driver_id}...")
         thread = threading.Thread(target=self._send_twilio_sms, args=(driver_id, score), daemon=True)
         thread.start()
 

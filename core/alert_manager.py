@@ -116,10 +116,8 @@ class AlertManager:
     # ─────────────────────────────────────────────
 
     def trigger(self, ear: float, mar: float,
-                cnn_class: str, cnn_confidence: float, alert_type: str):
-        """
-        Main entry point for alerts. Handles cooldowns, sound, logging, and external APIs.
-        """
+                cnn_class: str, cnn_confidence: float, alert_type: str, fatigue_score: float = 0.0):
+        
         now = time.time()
         if now - self.last_alert_time < self.ALERT_COOLDOWN:
             return
@@ -127,32 +125,35 @@ class AlertManager:
         self.last_alert_time = now
         self.alert_count    += 1
 
-        # 1. Local Audio Feedback
-        self._play_sound_async(priority=alert_type)
+        self._play_sound_async(priority=str(alert_type).lower())
 
-        # 2. External API Integrations (Async)
-        if alert_type == "high":
-            # Find a rest stop and update the UI when the request finishes
+        # ── API TRIGGER (BASED ON RAW SCORE) ──
+        # We stop relying on strings. If the score is high enough, we fire.
+        print(f"[DEBUG] Alert Manager triggered with score: {fatigue_score}")
+        
+        if fatigue_score >= 0.68: # Level 3 Threshold
+            print("\n[API] 🚨 LEVEL 3 CONFIRMED! Sending Twilio SMS...")
+            self.api.send_emergency_sms_async(driver_id=1, score=f"{fatigue_score:.2f}")
+            
+        elif fatigue_score >= 0.45: # Level 2 Threshold
+            print(f"\n[API] 📍 LEVEL 2 CONFIRMED! Fetching Rest Stop...")
             def set_destination(name):
                 self.suggested_destination = name
             self.api.fetch_rest_stop_async(callback=set_destination)
-            
-        elif alert_type == "critical":
-            # Send the emergency SMS text to the registered contact
-            self.api.send_emergency_sms_async(driver_id=self.session_id, score="CRITICAL")
+        # ──────────────────────────────────────
 
-        # 3. Database Logging
+        # Log to Database
         if self.session_id and self.session_id > 0:
             log_alert(
                 session_id=self.session_id,
-                alert_type=alert_type,
+                alert_type=str(alert_type),
                 ear=ear,
                 mar=mar,
                 cnn_class=cnn_class,
                 cnn_confidence=cnn_confidence
             )
 
-        print(f"[ALERT #{self.alert_count}] {alert_type.upper()} | "
+        print(f"[ALERT #{self.alert_count}] {str(alert_type).upper()} | "
               f"EAR={ear:.3f} MAR={mar:.3f} | "
               f"CNN={cnn_class} {cnn_confidence:.1%}")
 

@@ -15,6 +15,7 @@ def setup_database():
     cur = conn.cursor()
 
     # 1. Create Core Tables (If they don't exist)
+    # Note: New databases created here WILL use the dynamic (datetime('now')) default correctly.
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS drivers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,19 +38,26 @@ def setup_database():
     """)
 
     # 2. FORCE PATCH: Manually add columns to existing driver_profiles
-    # This prevents the "Table Exists but Column Missing" error
+    # SQLite logic: ALTER TABLE requires a CONSTANT default. 
+    # We use a placeholder string first, then update it.
     column_patches = [
         ("trust_index", "REAL DEFAULT 100.0"),
         ("sensitivity_modifier", "REAL DEFAULT 1.0"),
-        ("updated_at", "TEXT DEFAULT (datetime('now'))")
+        ("updated_at", "TEXT DEFAULT '2026-01-01 00:00:00'") 
     ]
 
     for col_name, col_type in column_patches:
         try:
+            # Attempt to add the column
             cur.execute(f"ALTER TABLE driver_profiles ADD COLUMN {col_name} {col_type}")
+            
+            # If we just added updated_at, sync it to the actual current time immediately
+            if col_name == "updated_at":
+                cur.execute("UPDATE driver_profiles SET updated_at = datetime('now')")
+            
             print(f"  + Added missing column: {col_name}")
         except sqlite3.OperationalError:
-            # Column already exists, which is fine
+            # This triggers if the column already exists, which we can safely ignore
             pass
 
     # 3. Seed Default Driver
@@ -63,24 +71,26 @@ def setup_database():
 def verify_database():
     conn = get_connection()
     cur = conn.cursor()
-    print("\n--Final Integrity Check --")
+    print("\n-- Final Integrity Check --")
     
     # Verify Columns in driver_profiles
     cur.execute("PRAGMA table_info(driver_profiles)")
     columns = [row[1] for row in cur.fetchall()]
     
-    check_cols = ["trust_index", "sensitivity_modifier"]
+    # Check all three new columns
+    check_cols = ["trust_index", "sensitivity_modifier", "updated_at"]
     all_passed = True
     
     for c in check_cols:
         status = "OK ✅" if c in columns else "MISSING ❌"
-        if "MISSING" in status: all_passed = False
+        if "MISSING" in status: 
+            all_passed = False
         print(f"  Column {c:<22} : {status}")
 
     if all_passed:
         print("\n[SUCCESS] Your database is 100% ready for the Trust Engine.")
     else:
-        print("\n[ERROR] Database mismatch detected.")
+        print("\n[ERROR] Database mismatch detected. Check the logic above.")
     
     conn.close()
 

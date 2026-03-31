@@ -138,11 +138,12 @@ class CircadianRiskEngine:
 class FatigueClassifier:
     def __init__(
         self,
-        session_start:  Optional[datetime] = None,
-        driver_id:      int = 1,
+        session_start: Optional[datetime] = None,
+        driver_id: int = 1,
     ):
-        self.driver_id  = driver_id
-        self.circadian  = CircadianRiskEngine(session_start=session_start)
+        self.driver_id = driver_id
+        # Assuming CircadianRiskEngine is imported or defined elsewhere
+        self.circadian = CircadianRiskEngine(session_start=session_start)
 
         self._ema_score = 0.0
         self._spike_count = 0
@@ -154,34 +155,40 @@ class FatigueClassifier:
         print(f"[CLASSIFIER] History sensitivity modifier: {self._history_modifier:.2f}")
 
     def classify(self, detector_result: dict) -> dict:
+        """Main entry point: process frame data and return fatigue state."""
         if not detector_result.get("face_found", False):
             self._decay_counters()
             return self._add_classifier_fields(detector_result, score=0.0, level=0)
 
+        # 1. Gather component scores
         circ_score, circ_label = self.circadian.get_risk()
-        sensitivity            = self.circadian.get_sensitivity_multiplier()
+        sensitivity = self.circadian.get_sensitivity_multiplier()
 
-        ear_score  = self._score_ear(detector_result.get("ear", 0.3))
-        mar_score  = self._score_mar(detector_result.get("mar", 0.2))
-        cnn_score  = self._score_cnn(
+        ear_score = self._score_ear(detector_result.get("ear", 0.3))
+        mar_score = self._score_mar(detector_result.get("mar", 0.2))
+        cnn_score = self._score_cnn(
             detector_result.get("cnn_class", "open_eye"),
             detector_result.get("cnn_confidence", 0.0)
         )
-        dur_score  = self.circadian._duration_score()
+        dur_score = self.circadian._duration_score()
 
+        # 2. Calculate weighted raw score
         raw_score = (
-            (ear_score  * WEIGHT_EAR)      +
-            (cnn_score  * WEIGHT_CNN)      +
-            (mar_score  * WEIGHT_MAR)      +
-            (circ_score * WEIGHT_CIRCADIAN)+
-            (dur_score  * WEIGHT_DURATION)
+            (ear_score   * WEIGHT_EAR)       +
+            (cnn_score   * WEIGHT_CNN)       +
+            (mar_score   * WEIGHT_MAR)       +
+            (circ_score  * WEIGHT_CIRCADIAN) +
+            (dur_score   * WEIGHT_DURATION)
         )
 
+        # 3. Apply multipliers (Circadian & Driver History)
         adjusted_score = min(raw_score * sensitivity * self._history_modifier, 1.0)
         adjusted_score = round(adjusted_score, 4)
 
-        level = self._stabilize_level(adjusted_score)
+        # 4. Smooth and Stabilize
+        level = self._process_ema_and_spikes(adjusted_score)
 
+        # 5. Logging and State Tracking
         if level != self._last_level:
             self._log_level_transition(level, adjusted_score, circ_label)
             self._last_level = level
@@ -195,8 +202,73 @@ class FatigueClassifier:
             sensitivity= sensitivity,
         )
 
+    def apply_cognitive_reward(self):
+        """Driver passed the test. Drop the EMA score to give them breathing room."""
+        # Significant drop in score
+        self._ema_score = max(0.0, round(self._ema_score - 0.25, 4))
+        # Reset spikes since they've proven alertness
+        self._spike_count = 0
+        self._update_confirmed_level()
+        print(f"[CLASSIFIER] Reward applied. New EMA: {self._ema_score}")
+
+    def apply_cognitive_penalty(self):
+        """Driver failed/ignored test. Spike the EMA to force higher fatigue level."""
+        # Jump the score up
+        self._ema_score = min(1.0, round(self._ema_score + 0.35, 4))
+        # Force the spike logic to trigger Level 1+ immediately
+        self._spike_count = max(self._spike_count, 2)
+        self._update_confirmed_level()
+        print(f"[CLASSIFIER] Penalty applied. New EMA: {self._ema_score}")
+
     def get_current_level(self) -> int:
         return self._confirmed_level
+
+    # --- Internal Logic ---
+
+    def _process_ema_and_spikes(self, score: float) -> int:
+        """Handles the temporal smoothing of the raw fatigue score."""
+        ALPHA_UP   = 0.55
+        ALPHA_DOWN = 0.04
+
+        # Track "spikes" for immediate reaction to heavy eye closure
+        if score >= 0.45:
+            self._spike_count += 1
+        else:
+            self._spike_count = max(0, self._spike_count - 1)
+
+        # Exponential Moving Average (EMA)
+        if score > self._ema_score:
+            self._ema_score = ALPHA_UP   * score + (1 - ALPHA_UP)   * self._ema_score
+        else:
+            self._ema_score = ALPHA_DOWN * score + (1 - ALPHA_DOWN) * self._ema_score
+
+        self._ema_score = round(self._ema_score, 4)
+        return self._update_confirmed_level()
+
+    def _update_confirmed_level(self) -> int:
+        """Calculates the discrete level based on EMA and Spike thresholds."""
+        ema_level = 0
+        if self._ema_score >= LEVEL_3_THRESHOLD:
+            ema_level = 3
+        elif self._ema_score >= LEVEL_2_THRESHOLD:
+            ema_level = 2
+        elif self._ema_score >= LEVEL_1_THRESHOLD:
+            ema_level = 1
+
+        # Spikes act as an immediate floor (at least Level 1)
+        spike_level = 1 if self._spike_count >= 2 else 0
+
+        self._confirmed_level = max(ema_level, spike_level)
+        return self._confirmed_level
+
+    def _decay_counters(self):
+        """Called when face is lost; slowly bleeds off fatigue score."""
+        ALPHA_DECAY = 0.08
+        self._ema_score = ALPHA_DECAY * 0.0 + (1 - ALPHA_DECAY) * self._ema_score
+        self._ema_score = round(self._ema_score, 4)
+        self._spike_count = 0
+        if self._ema_score < LEVEL_1_THRESHOLD:
+            self._confirmed_level = 0
 
     @staticmethod
     def _score_ear(ear: float) -> float:
@@ -218,43 +290,6 @@ class FatigueClassifier:
             return round(confidence * 1.0, 4)
         return 0.0
 
-    def _stabilize_level(self, score: float) -> int:
-        ALPHA_UP   = 0.55
-        ALPHA_DOWN = 0.04
-
-        if score >= 0.45:
-            self._spike_count += 1
-        else:
-            self._spike_count = max(0, self._spike_count - 1)
-
-        if score > self._ema_score:
-            self._ema_score = ALPHA_UP   * score + (1 - ALPHA_UP)   * self._ema_score
-        else:
-            self._ema_score = ALPHA_DOWN * score + (1 - ALPHA_DOWN) * self._ema_score
-
-        self._ema_score = round(self._ema_score, 4)
-
-        ema_level = 0
-        if self._ema_score >= LEVEL_3_THRESHOLD:
-            ema_level = 3
-        elif self._ema_score >= LEVEL_2_THRESHOLD:
-            ema_level = 2
-        elif self._ema_score >= LEVEL_1_THRESHOLD:
-            ema_level = 1
-
-        spike_level = 1 if self._spike_count >= 2 else 0
-
-        self._confirmed_level = max(ema_level, spike_level)
-        return self._confirmed_level
-
-    def _decay_counters(self):
-        ALPHA_DOWN = 0.08
-        self._ema_score = ALPHA_DOWN * 0.0 + (1 - ALPHA_DOWN) * self._ema_score
-        self._ema_score = round(self._ema_score, 4)
-        self._spike_count = 0
-        if self._ema_score < LEVEL_1_THRESHOLD:
-            self._confirmed_level = 0
-
     @staticmethod
     def _add_classifier_fields(
         result:      dict,
@@ -264,28 +299,19 @@ class FatigueClassifier:
         circ_label:  str   = "low",
         sensitivity: float = 1.0,
     ) -> dict:
-        labels = {
-            0: "Alert",
-            1: "Mild Fatigue",
-            2: "High Fatigue",
-            3: "Critical Fatigue",
-        }
-        priorities = {
-            0: "none",
-            1: "low",
-            2: "high",
-            3: "critical",
-        }
+        labels = {0: "Alert", 1: "Mild Fatigue", 2: "High Fatigue", 3: "Critical Fatigue"}
+        priorities = {0: "none", 1: "low", 2: "high", 3: "critical"}
 
-        result["fatigue_score"]           = score
-        result["fatigue_level"]           = level
-        result["level_label"]             = labels[level]
-        result["circadian_score"]         = circ_score
-        result["circadian_label"]         = circ_label
-        result["sensitivity_multiplier"]  = sensitivity
-        result["alert_priority"]          = priorities[level]
-
-        result["should_alert"] = level >= 1 and result.get("face_found", False)
+        result.update({
+            "fatigue_score": score,
+            "fatigue_level": level,
+            "level_label": labels[level],
+            "circadian_score": circ_score,
+            "circadian_label": circ_label,
+            "sensitivity_multiplier": sensitivity,
+            "alert_priority": priorities[level],
+            "should_alert": level >= 1 and result.get("face_found", False)
+        })
 
         if result.get("face_found", False):
             result["status"] = labels[level].upper().replace(" ", "_")
@@ -294,16 +320,14 @@ class FatigueClassifier:
 
     def _load_history_modifier(self) -> float:
         try:
-            conn = _get_conn()
-            row  = conn.execute(
+            conn = _get_conn() # Ensure this helper is available
+            row = conn.execute(
                 "SELECT sensitivity_modifier FROM driver_profiles WHERE driver_id = ?",
                 (self.driver_id,)
             ).fetchone()
             conn.close()
-
             if row:
-                modifier = float(row["sensitivity_modifier"])
-                return min(max(modifier, 0.7), 1.5)
+                return min(max(float(row["sensitivity_modifier"]), 0.7), 1.5)
             return 1.0
         except Exception:
             return 1.0
@@ -315,19 +339,12 @@ class FatigueClassifier:
                 """INSERT INTO fatigue_events
                    (driver_id, fatigue_level, fatigue_score, circadian_label, timestamp)
                    VALUES (?, ?, ?, ?, ?)""",
-                (
-                    self.driver_id,
-                    new_level,
-                    score,
-                    circ_label,
-                    datetime.now().isoformat(),
-                )
+                (self.driver_id, new_level, score, circ_label, datetime.now().isoformat())
             )
             conn.commit()
             conn.close()
         except Exception:
             pass
-
 
 # ─────────────────────────────────────────────
 # LEVEL DESCRIPTIONS (for AlertManager)
