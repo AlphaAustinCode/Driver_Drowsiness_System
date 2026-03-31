@@ -5,20 +5,22 @@ import threading
 import numpy as np
 import cv2
 
+# Ensure core and database modules are discoverable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from database.db_queries import log_alert
 
+from database.db_queries import log_alert
+from core.api_services import APIManager
 
 class AlertManager:
     """
-    Manages drowsiness alerts with graduated audio responses.
+    Manages drowsiness alerts with graduated audio responses and API integrations.
     Levels: 
       - low: Mild fatigue (two mid-pitch beeps)
-      - high: High fatigue (triple fast beep)
-      - critical: Emergency (siren effect)
+      - high: High fatigue (triple fast beep + Google Maps API rest stop search)
+      - critical: Emergency (siren effect + Twilio SMS Alert)
     """
 
-    # Cooldown between consecutive alerts (seconds)
+    # Cooldown between consecutive alerts (seconds) to prevent spamming
     ALERT_COOLDOWN = 4.0
 
     def __init__(self, session_id: int):
@@ -27,6 +29,10 @@ class AlertManager:
         self.alert_count     = 0
         self._sound_thread   = None
         self._pygame_ok      = self._init_pygame()
+        
+        # API Integration State
+        self.api = APIManager()
+        self.suggested_destination = None
 
     def _init_pygame(self) -> bool:
         """Initialize pygame mixer for beep generation."""
@@ -40,11 +46,11 @@ class AlertManager:
             return False
 
     # ─────────────────────────────────────────────
-    # SOUND GENERATION
+    # SOUND GENERATION (Digital Synthesis)
     # ─────────────────────────────────────────────
 
     def _generate_beep(self, frequency: int = 880, duration_ms: int = 800):
-        """Synthesize a sine wave tone in memory."""
+        """Synthesize a sine wave tone in memory to avoid external file dependencies."""
         if not self._pygame_ok:
             return
         try:
@@ -54,6 +60,8 @@ class AlertManager:
 
             wave     = np.sin(2 * np.pi * frequency * t)
             envelope = np.ones(n_samples)
+            
+            # Simple ADSR envelope to prevent clicking sounds
             attack   = int(sample_rate * 0.01)
             decay    = int(sample_rate * 0.1)
             envelope[:attack]  = np.linspace(0, 1, attack)
@@ -92,11 +100,10 @@ class AlertManager:
                 self._generate_beep(frequency=1200, duration_ms=400)
                 time.sleep(0.05)
         else:
-            # Fallback (e.g., general yawning)
             self._generate_beep(frequency=880, duration_ms=300)
 
     def _play_sound_async(self, priority: str):
-        """Trigger sound in background — doesn't block video loop."""
+        """Trigger sound in background — doesn't block the CV processing loop."""
         if self._sound_thread is not None and self._sound_thread.is_alive():
             return 
         self._sound_thread = threading.Thread(
@@ -105,14 +112,13 @@ class AlertManager:
         self._sound_thread.start()
 
     # ─────────────────────────────────────────────
-    # TRIGGER
+    # TRIGGER & API BRIDGE
     # ─────────────────────────────────────────────
 
     def trigger(self, ear: float, mar: float,
                 cnn_class: str, cnn_confidence: float, alert_type: str):
         """
-        Fire an alert if cooldown has passed.
-        Passes priority level to the async sound player.
+        Main entry point for alerts. Handles cooldowns, sound, logging, and external APIs.
         """
         now = time.time()
         if now - self.last_alert_time < self.ALERT_COOLDOWN:
@@ -121,9 +127,21 @@ class AlertManager:
         self.last_alert_time = now
         self.alert_count    += 1
 
-        # Passes priority level ('low', 'high', 'critical') to the sound system
+        # 1. Local Audio Feedback
         self._play_sound_async(priority=alert_type)
 
+        # 2. External API Integrations (Async)
+        if alert_type == "high":
+            # Find a rest stop and update the UI when the request finishes
+            def set_destination(name):
+                self.suggested_destination = name
+            self.api.fetch_rest_stop_async(callback=set_destination)
+            
+        elif alert_type == "critical":
+            # Send the emergency SMS text to the registered contact
+            self.api.send_emergency_sms_async(driver_id=self.session_id, score="CRITICAL")
+
+        # 3. Database Logging
         if self.session_id and self.session_id > 0:
             log_alert(
                 session_id=self.session_id,
@@ -139,22 +157,22 @@ class AlertManager:
               f"CNN={cnn_class} {cnn_confidence:.1%}")
 
     # ─────────────────────────────────────────────
-    # OVERLAY
+    # UI OVERLAY
     # ─────────────────────────────────────────────
 
     def draw_overlay(self, frame: np.ndarray,
-                      status: str,
-                      ear: float,
-                      mar: float,
-                      cnn_class: str,
-                      cnn_confidence: float,
-                      frame_counter: int,
-                      frame_threshold: int) -> np.ndarray:
-        """Draw live info panel + status banner onto the OpenCV frame."""
+                     status: str,
+                     ear: float,
+                     mar: float,
+                     cnn_class: str,
+                     cnn_confidence: float,
+                     frame_counter: int,
+                     frame_threshold: int) -> np.ndarray:
+        """Draw live info panel + status banner + API suggestions onto the frame."""
         h, w   = frame.shape[:2]
         is_alert = any(x in status for x in ["ALERT", "DROWSY", "CRITICAL", "HIGH", "LOW"])
 
-        # ── Status banner (top) ──
+        # ── Banner (Top) ──
         if status == "NO_FACE":
             banner_color = (80, 80, 80)
             banner_text  = "NO FACE DETECTED"
@@ -167,35 +185,34 @@ class AlertManager:
             banner_text  = "SYSTEM ACTIVE"
 
         cv2.rectangle(frame, (0, 0), (w, 50), banner_color, -1)
-        cv2.putText(frame, banner_text,
-                    (w // 2 - len(banner_text) * 8, 33),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.9,
-                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, banner_text, (w // 2 - len(banner_text) * 8, 33),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
 
-        # ── Info panel (bottom-left) ──
+        # ── Navigation Suggestion (API Result) ──
+        if self.suggested_destination:
+            # Displayed above the bottom panel
+            cv2.rectangle(frame, (10, h - 195), (w - 10, h - 165), (0, 0, 0), -1)
+            cv2.putText(frame, f"SUGGESTED STOP: {self.suggested_destination}", 
+                        (15, h - 175), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # ── Info Panel (Bottom-Left) ──
         panel_x, panel_y = 10, h - 160
-        cv2.rectangle(frame, (panel_x - 5, panel_y - 10),
-                      (300, h - 5), (20, 20, 20), -1)
-        cv2.rectangle(frame, (panel_x - 5, panel_y - 10),
-                      (300, h - 5), (80, 80, 80), 1)
+        cv2.rectangle(frame, (panel_x - 5, panel_y - 10), (300, h - 5), (20, 20, 20), -1)
+        cv2.rectangle(frame, (panel_x - 5, panel_y - 10), (300, h - 5), (80, 80, 80), 1)
 
         font   = cv2.FONT_HERSHEY_SIMPLEX
         fsmall = 0.52
         line_h = 26
 
-        # EAR & MAR Stats
         cv2.putText(frame, f"EAR: {ear:.3f}", (panel_x, panel_y + line_h * 0), font, fsmall, (255, 255, 255), 1)
         cv2.putText(frame, f"MAR: {mar:.3f}", (panel_x, panel_y + line_h * 1), font, fsmall, (255, 255, 255), 1)
-        
-        # CNN Confidence
         cv2.putText(frame, f"CNN: {cnn_class} {cnn_confidence:.0%}", (panel_x, panel_y + line_h * 2), font, fsmall, (0, 255, 255), 1)
+        
+        # Intensity Bar logic
+        cv2.putText(frame, f"Intensity: {frame_counter}/{frame_threshold}", 
+                    (panel_x, panel_y + line_h * 3 + 16), font, fsmall, (200, 200, 200), 1)
 
-        # Drowsy frame counter
-        safe_threshold = max(frame_threshold, 1)
-        progress       = min(frame_counter / safe_threshold, 1.0)
-        cv2.putText(frame, f"Intensity: {frame_counter}/{frame_threshold}", (panel_x, panel_y + line_h * 3 + 16), font, fsmall, (200, 200, 200), 1)
-
-        # Alert count + quit hint
+        # ── Global Metadata ──
         cv2.putText(frame, f"Alerts: {self.alert_count}", (w - 110, h - 15), font, fsmall, (200, 200, 200), 1)
         cv2.putText(frame, "Q = quit", (w - 90, 40), font, 0.45, (180, 180, 180), 1)
 
