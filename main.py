@@ -32,7 +32,7 @@ DRIVER_ID   = 1
 # ─────────────────────────────────────────────
 
 def find_camera(forced_index: int = None) -> cv2.VideoCapture:
-    indices = [forced_index] if forced_index is not None else [0, 1, 2]
+    indices = [forced_index] if forced_index is not None else [1, 2]
     for idx in indices:
         print(f"[CAM] Trying camera index {idx}...")
         cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
